@@ -19,11 +19,11 @@ use Piwik\CronArchive\FixedSiteIds;
 use Piwik\CronArchive\Performance\Logger;
 use Piwik\CronArchive\SharedSiteIds;
 use Piwik\Archive\ArchiveInvalidator;
+use Piwik\CronArchive\StopArchiverException;
 use Piwik\DataAccess\ArchiveSelector;
 use Piwik\DataAccess\RawLogDao;
 use Piwik\Exception\UnexpectedWebsiteFoundException;
 use Piwik\Metrics\Formatter;
-use Piwik\Period\Factory;
 use Piwik\Period\Factory as PeriodFactory;
 use Piwik\CronArchive\SitesToReprocessDistributedList;
 use Piwik\CronArchive\SegmentArchivingRequestUrlProvider;
@@ -324,10 +324,14 @@ class CronArchive
 
         $self = $this;
         Access::doAsSuperUser(function () use ($self) {
-            $self->init();
-            $self->run();
-            $self->runScheduledTasks();
-            $self->end();
+            try {
+                $self->init();
+                $self->run();
+                $self->runScheduledTasks();
+                $self->end();
+            } catch (StopArchiverException $e) {
+                $this->logger->info("Archiving stopped by stop archiver exception");
+            }
         });
     }
 
@@ -898,6 +902,8 @@ class CronArchive
 
         $visitsLastDays = 0;
 
+        $this->invalidateArchivedReportsForSitesThatNeedToBeArchivedAgain();
+
         list($isThereArchive, $newDate) = $this->isThereAValidArchiveForPeriod($idSite, 'day', $date, $segment = '');
         if ($isThereArchive) {
             $visitsToday = Archive::build($idSite, 'day', $date)->getNumeric('nb_visits');
@@ -972,18 +978,27 @@ class CronArchive
         return $dayArchiveWasSuccessful;
     }
 
-    private function isThereAValidArchiveForPeriod($idSite, $period, $date, $segment = '')
+    // public for tests
+    public function isThereAValidArchiveForPeriod($idSite, $period, $date, $segment = '')
     {
         if (Range::isMultiplePeriod($date, $period)) {
-            $rangePeriod = Factory::build($period, $date, Site::getTimezoneFor($idSite));
+            $rangePeriod = PeriodFactory::build($period, $date, Site::getTimezoneFor($idSite));
             $periodsToCheck = $rangePeriod->getSubperiods();
         } else {
-            $periodsToCheck = [Factory::build($period, $date, Site::getTimezoneFor($idSite))];
+            $periodsToCheck = [PeriodFactory::build($period, $date, Site::getTimezoneFor($idSite))];
+        }
+
+        $isTodayIncluded = $this->isTodayIncludedInPeriod($idSite, $periodsToCheck);
+        $isLast = preg_match('/^last([0-9]+)/', $date, $matches);
+
+        // don't do this check for a single period that includes today
+        if ($isTodayIncluded
+            && !$isLast
+        ) {
+            return [false, $date];
         }
 
         $periodsToCheckRanges = array_map(function (Period $p) { return $p->getRangeString(); }, $periodsToCheck);
-
-        $this->invalidateArchivedReportsForSitesThatNeedToBeArchivedAgain();
 
         $archiveIds = ArchiveSelector::getArchiveIds(
             [$idSite], $periodsToCheck, new Segment($segment, [$idSite]), $plugins = [], // empty plugins param since we only check for an 'all' archive
@@ -1003,34 +1018,57 @@ class CronArchive
         // if there is an invalidated archive within the range, find out the oldest one and how far it is from today,
         // and change the lastN $date to be value so it is correctly re-processed.
         $newDate = $date;
-        if (!$isThereArchiveForAllPeriods
-            && preg_match('/^last([0-9]+)/', $date, $matches)
-        ) {
-            $lastNValue = (int) $matches[1];
+        if ($isLast) {
+            if (!$isThereArchiveForAllPeriods) {
+                $lastNValue = (int)$matches[1];
 
-            usort($diff, function ($lhs, $rhs) {
-                $lhsDate = explode(',', $lhs)[0];
-                $rhsDate = explode(',', $rhs)[0];
+                usort($diff, function ($lhs, $rhs) {
+                    $lhsDate = explode(',', $lhs)[0];
+                    $rhsDate = explode(',', $rhs)[0];
 
-                if ($lhsDate == $rhsDate) {
-                    return 1;
-                } else if (Date::factory($lhsDate)->isEarlier(Date::factory($rhsDate))) {
-                    return -1;
-                } else {
-                    return 1;
-                }
-            });
+                    if ($lhsDate == $rhsDate) {
+                        return 1;
+                    } else if (Date::factory($lhsDate)->isEarlier(Date::factory($rhsDate))) {
+                        return -1;
+                    } else {
+                        return 1;
+                    }
+                });
 
-            $oldestDateWithoutArchive = explode(',', reset($diff))[0];
-            $todayInTimezone = Date::factoryInTimezone('today', Site::getTimezoneFor($idSite));
+                $oldestDateWithoutArchive = explode(',', reset($diff))[0];
+                $todayInTimezone = Date::factoryInTimezone('today', Site::getTimezoneFor($idSite));
 
-            /** @var Range $newRangePeriod */
-            $newRangePeriod = PeriodFactory::build($period, $oldestDateWithoutArchive . ',' . $todayInTimezone);
+                /** @var Range $newRangePeriod */
+                $newRangePeriod = PeriodFactory::build($period, $oldestDateWithoutArchive . ',' . $todayInTimezone);
 
-            $newDate = 'last' . min($lastNValue, $newRangePeriod->getNumberOfSubperiods());
+                $newDate = 'last' . max(min($lastNValue, $newRangePeriod->getNumberOfSubperiods()), 2);
+            } else if ($isTodayIncluded) {
+                $isThereArchiveForAllPeriods = false;
+                $newDate = 'last2';
+            }
         }
 
         return [$isThereArchiveForAllPeriods, $newDate];
+    }
+
+    /**
+     * @param int $idSite
+     * @param Period[] $periods
+     * @return bool
+     * @throws Exception
+     */
+    private function isTodayIncludedInPeriod($idSite, $periods)
+    {
+        $timezone = Site::getTimezoneFor($idSite);
+        $today = Date::factoryInTimezone('today', $timezone);
+
+        foreach ($periods as $period) {
+            if ($period->isDateInPeriod($today)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -1101,6 +1139,8 @@ class CronArchive
                 if ($self->isAlreadyArchivingUrl($url, $idSite, $period, $date)) {
                     return Request::ABORT;
                 }
+
+                $this->invalidateArchivedReportsForSitesThatNeedToBeArchivedAgain();
 
                 list($isThereArchive, $newDate) = $this->isThereAValidArchiveForPeriod($idSite, $period, $date, $segment);
                 if ($isThereArchive) {
@@ -1978,6 +2018,8 @@ class CronArchive
                 if ($self->isAlreadyArchivingSegment($urlWithSegment, $idSite, $period, $segment)) {
                     return Request::ABORT;
                 }
+
+                $this->invalidateArchivedReportsForSitesThatNeedToBeArchivedAgain();
 
                 list($isThereArchive, $newDate) = $this->isThereAValidArchiveForPeriod($idSite, $period, $date, $segment);
                 if ($isThereArchive) {
